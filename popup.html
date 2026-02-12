@@ -1,0 +1,56 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Form Saver</title>
+  <style>
+    body { font: 13px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 12px; width: 380px; }
+    .row { margin: 8px 0; }
+    button { width: 100%; padding: 10px; border: 0; border-radius: 10px; cursor: pointer; }
+    #clear { margin-top: 8px; }
+    #view { margin-top: 8px; }
+    .meta { font-size: 12px; opacity: .85; }
+    .ok { color: #0a7a2f; }
+    .bad { color: #b00020; }
+    .box { padding: 10px; border-radius: 10px; border: 1px solid rgba(0,0,0,.12); }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    details { border: 1px solid rgba(0,0,0,.12); border-radius: 10px; padding: 8px 10px; }
+    summary { cursor: pointer; }
+    .small { font-size: 12px; }
+    .pill { display:inline-block; padding:2px 6px; border:1px solid rgba(0,0,0,.15); border-radius:999px; margin-right:6px; }
+    .kv { white-space: pre-wrap; word-break: break-word; }
+  </style>
+</head>
+<body>
+  <div class="row box">
+    <div class="meta">Current page key</div>
+    <div id="pageKey" class="mono" style="word-break: break-all;"></div>
+  </div>
+
+  <div class="row">
+    <button id="restore">Restore form values for this page</button>
+    <button id="view">View saved data</button>
+    <button id="clear">Remove ALL saved data</button>
+  </div>
+
+  <div class="row box">
+    <div class="meta">Storage</div>
+    <div id="storageLine" class="mono"></div>
+    <div id="pagesCount" class="meta" style="margin-top:6px;"></div>
+  </div>
+
+  <div class="row">
+    <div id="status" class="meta"></div>
+  </div>
+
+  <div class="row" id="savedPanel" style="display:none;">
+    <div class="box">
+      <div class="meta" style="margin-bottom:6px;">Saved URLs and values</div>
+      <div id="savedList"></div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
