@@ -5,11 +5,15 @@
   // delete old pages until we are <= this ratio of QUOTA_BYTES
   const TARGET_RATIO = 0.90;
 
+  // how long to keep retrying restores while the page is still rendering (SPA / late DOM)
+  const RESTORE_RETRY_MS = 4500;
+
   let saveTimer = null;
   let restoring = false;
 
   // only store changes made by the user since last save
-  const changedMap = new Map(); // stableKey -> { id, tag, type, value }
+  // stableKey -> { id, tag, type, value, fingerprint }
+  const changedMap = new Map();
 
   function pageKey() {
     return location.origin + location.pathname + location.search; // per exact page
@@ -48,12 +52,65 @@
       const parent = cur.parentElement;
       if (!parent) break;
 
-      const siblings = Array.from(parent.children).filter(c => c.tagName === cur.tagName);
+      const siblings = Array.from(parent.children).filter((c) => c.tagName === cur.tagName);
       const idx = siblings.indexOf(cur) + 1;
       parts.unshift(`${tag}:nth-of-type(${idx})`);
       cur = parent;
     }
     return parts.join(" > ");
+  }
+
+  function normalizeText(s) {
+    return (s || "").trim().toLowerCase().replace(/\s+/g, " ").slice(0, 160);
+  }
+
+  function getLabelText(el) {
+    // <label for="...">
+    if (el && el.id) {
+      try {
+        const lab = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        if (lab && lab.innerText) return normalizeText(lab.innerText);
+      } catch {
+        // ignore
+      }
+    }
+
+    // <label><input ...> ...</label>
+    const wrapping = el ? el.closest("label") : null;
+    if (wrapping && wrapping.innerText) return normalizeText(wrapping.innerText);
+
+    // try aria-labelledby (may break if ids change, but sometimes still works)
+    const labelledBy = el ? el.getAttribute("aria-labelledby") : null;
+    if (labelledBy) {
+      const ids = labelledBy.split(/\s+/).filter(Boolean);
+      const texts = [];
+      for (const id of ids) {
+        const node = document.getElementById(id);
+        if (node && node.innerText) texts.push(node.innerText);
+      }
+      if (texts.length) return normalizeText(texts.join(" "));
+    }
+
+    return "";
+  }
+
+  function getFingerprint(el) {
+    const tag = el.tagName;
+    const type = (el.getAttribute("type") || "").toLowerCase();
+    const form = el.form;
+
+    return {
+      tag,
+      type,
+      name: el.getAttribute("name") || "",
+      autocomplete: el.getAttribute("autocomplete") || "",
+      placeholder: el.getAttribute("placeholder") || "",
+      ariaLabel: el.getAttribute("aria-label") || "",
+      ariaLabelledBy: el.getAttribute("aria-labelledby") || "",
+      labelText: getLabelText(el),
+      testid: el.getAttribute("data-testid") || el.getAttribute("data-qa") || el.getAttribute("data-cy") || "",
+      formAction: (form && (form.getAttribute("action") || "")) || location.pathname
+    };
   }
 
   function readControlValue(el) {
@@ -69,8 +126,8 @@
       if (el.multiple) {
         const selected = Array.from(el.options)
           .map((opt, i) => (opt.selected ? i : -1))
-          .filter(i => i !== -1);
-        return { t: "select-multiple", selectedIndexes: selected, values: selected.map(i => el.options[i]?.value) };
+          .filter((i) => i !== -1);
+        return { t: "select-multiple", selectedIndexes: selected, values: selected.map((i) => el.options[i]?.value) };
       }
       return { t: "select", selectedIndex: el.selectedIndex, value: el.value };
     }
@@ -83,15 +140,29 @@
     const tag = el.tagName;
     if (tag === "INPUT") {
       const type = (el.getAttribute("type") || "text").toLowerCase();
-      if (type === "checkbox" && data.t === "checkbox") { el.checked = !!data.checked; return; }
-      if (type === "radio" && data.t === "radio") { el.checked = !!data.checked; return; }
-      if (data.t === "input") { el.value = data.value ?? ""; return; }
+      if (type === "checkbox" && data.t === "checkbox") {
+        el.checked = !!data.checked;
+        return;
+      }
+      if (type === "radio" && data.t === "radio") {
+        el.checked = !!data.checked;
+        return;
+      }
+      if (data.t === "input") {
+        el.value = data.value ?? "";
+        return;
+      }
     }
-    if (tag === "TEXTAREA" && data.t === "textarea") { el.value = data.value ?? ""; return; }
+    if (tag === "TEXTAREA" && data.t === "textarea") {
+      el.value = data.value ?? "";
+      return;
+    }
     if (tag === "SELECT") {
       if (el.multiple && data.t === "select-multiple") {
         const idxSet = new Set(data.selectedIndexes || []);
-        Array.from(el.options).forEach((opt, i) => { opt.selected = idxSet.has(i); });
+        Array.from(el.options).forEach((opt, i) => {
+          opt.selected = idxSet.has(i);
+        });
         return;
       }
       if (!el.multiple && data.t === "select") {
@@ -99,6 +170,15 @@
         else if (typeof data.selectedIndex === "number") el.selectedIndex = data.selectedIndex;
         return;
       }
+    }
+  }
+
+  function dispatchInputChange(el) {
+    try {
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    } catch {
+      // ignore
     }
   }
 
@@ -181,9 +261,166 @@
   function findElementByStableId(stable) {
     if (!stable) return null;
     if (stable.kind === "id") return document.getElementById(stable.value);
-    if (stable.kind === "name") return document.querySelector(`${stable.tag.toLowerCase()}[name="${CSS.escape(stable.value)}"]`);
-    if (stable.kind === "path") return document.querySelector(stable.value);
+    if (stable.kind === "name") {
+      try {
+        return document.querySelector(`${stable.tag.toLowerCase()}[name="${CSS.escape(stable.value)}"]`);
+      } catch {
+        return null;
+      }
+    }
+    if (stable.kind === "path") {
+      try {
+        return document.querySelector(stable.value);
+      } catch {
+        return null;
+      }
+    }
     return null;
+  }
+
+  function scoreMatch(fp, el) {
+    if (!fp || !el) return 0;
+
+    let s = 0;
+
+    if (el.tagName === fp.tag) s += 3;
+    const type = (el.getAttribute("type") || "").toLowerCase();
+    if ((type || "") === (fp.type || "")) s += 3;
+
+    const formAction = (el.form && (el.form.getAttribute("action") || "")) || location.pathname;
+    if (fp.formAction && formAction === fp.formAction) s += 2;
+
+    const name = el.getAttribute("name") || "";
+    if (fp.name && name === fp.name) s += 10;
+
+    const testid = el.getAttribute("data-testid") || el.getAttribute("data-qa") || el.getAttribute("data-cy") || "";
+    if (fp.testid && testid === fp.testid) s += 12;
+
+    const placeholder = el.getAttribute("placeholder") || "";
+    if (fp.placeholder && placeholder === fp.placeholder) s += 5;
+
+    const autocomplete = el.getAttribute("autocomplete") || "";
+    if (fp.autocomplete && autocomplete === fp.autocomplete) s += 3;
+
+    const aria = el.getAttribute("aria-label") || "";
+    if (fp.ariaLabel && aria === fp.ariaLabel) s += 6;
+
+    const label = getLabelText(el);
+    if (fp.labelText && label && label === normalizeText(fp.labelText)) s += 10;
+
+    return s;
+  }
+
+  function findBestByFingerprint(fp) {
+    if (!fp) return null;
+    const all = Array.from(document.querySelectorAll("input,textarea,select")).filter(isUsableControl);
+
+    let best = null;
+    let bestScore = 0;
+
+    for (const el of all) {
+      const sc = scoreMatch(fp, el);
+      if (sc > bestScore) {
+        bestScore = sc;
+        best = el;
+      }
+    }
+
+    // threshold to avoid filling wrong fields
+    return bestScore >= 12 ? best : null;
+  }
+
+  function applyToElement(el, item) {
+    if (!el || !isUsableControl(el)) return false;
+
+    // radios: only check the matching value
+    if (el.tagName === "INPUT" && (el.type || "").toLowerCase() === "radio" && item.value?.t === "radio") {
+      if (el.value !== item.value.value) return false;
+    }
+
+    writeControlValue(el, item.value);
+    dispatchInputChange(el);
+    return true;
+  }
+
+  function tryRestoreItems(pending) {
+    let changed = false;
+
+    for (const [k, item] of pending.entries()) {
+      const stable = item.id;
+
+      // 1) radio groups and other name-based fields (may match multiple)
+      if (stable?.kind === "name" && stable.value && stable.tag) {
+        let any = false;
+        try {
+          const all = Array.from(
+            document.querySelectorAll(`${stable.tag.toLowerCase()}[name="${CSS.escape(stable.value)}"]`)
+          ).filter(isUsableControl);
+
+          for (const el of all) {
+            if (applyToElement(el, item)) any = true;
+          }
+        } catch {
+          // ignore
+        }
+        if (any) {
+          pending.delete(k);
+          changed = true;
+          continue;
+        }
+      }
+
+      // 2) direct stable locator
+      const el = findElementByStableId(stable);
+      if (applyToElement(el, item)) {
+        pending.delete(k);
+        changed = true;
+        continue;
+      }
+
+      // 3) best-match fingerprint (handles changing ids / shifting DOM)
+      const byFp = findBestByFingerprint(item.fingerprint);
+      if (applyToElement(byFp, item)) {
+        pending.delete(k);
+        changed = true;
+        continue;
+      }
+    }
+
+    return changed;
+  }
+
+  async function restoreWithRetries(entry, timeoutMs = RESTORE_RETRY_MS) {
+    const pending = new Map();
+    for (const item of entry.data) pending.set(stableKey(item?.id), item);
+
+    // initial attempt
+    tryRestoreItems(pending);
+    if (pending.size === 0) return { ok: true };
+
+    // retry while DOM is still changing (SPAs / delayed rendering)
+    return await new Promise((resolve) => {
+      const obs = new MutationObserver(() => {
+        tryRestoreItems(pending);
+        if (pending.size === 0) {
+          obs.disconnect();
+          resolve({ ok: true });
+        }
+      });
+
+      try {
+        obs.observe(document.documentElement, { childList: true, subtree: true });
+      } catch {
+        // if observe fails, just return current result
+        resolve({ ok: pending.size === 0, missing: pending.size });
+        return;
+      }
+
+      setTimeout(() => {
+        obs.disconnect();
+        resolve({ ok: pending.size === 0, missing: pending.size });
+      }, timeoutMs);
+    });
   }
 
   async function restoreCurrentPage() {
@@ -194,39 +431,7 @@
 
     restoring = true;
     try {
-      for (const item of entry.data) {
-        const stable = item.id;
-
-        if (stable?.kind === "name" && stable.value && stable.tag) {
-          const all = Array.from(
-            document.querySelectorAll(`${stable.tag.toLowerCase()}[name="${CSS.escape(stable.value)}"]`)
-          ).filter(isUsableControl);
-
-          for (const el of all) {
-            if (el.tagName === "INPUT" && (el.type || "").toLowerCase() === "radio" && item.value?.t === "radio") {
-              if (el.value === item.value.value) {
-                writeControlValue(el, item.value);
-                el.dispatchEvent(new Event("input", { bubbles: true }));
-                el.dispatchEvent(new Event("change", { bubbles: true }));
-              }
-            } else {
-              writeControlValue(el, item.value);
-              el.dispatchEvent(new Event("input", { bubbles: true }));
-              el.dispatchEvent(new Event("change", { bubbles: true }));
-            }
-          }
-          continue;
-        }
-
-        const el = findElementByStableId(stable);
-        if (!el || !isUsableControl(el)) continue;
-
-        writeControlValue(el, item.value);
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-        el.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-
-      return { ok: true };
+      return await restoreWithRetries(entry);
     } finally {
       restoring = false;
     }
@@ -238,26 +443,35 @@
       id,
       tag: el.tagName,
       type: (el.getAttribute && el.getAttribute("type")) || null,
-      value: readControlValue(el)
+      value: readControlValue(el),
+      fingerprint: getFingerprint(el)
     });
   }
 
   // Save only when user actually changes something (typing/paste/click)
-  document.addEventListener("input", (e) => {
-    if (restoring) return;
-    if (!e.isTrusted) return;
-    if (!isUsableControl(e.target)) return;
-    recordChange(e.target);
-    scheduleSave();
-  }, true);
+  document.addEventListener(
+    "input",
+    (e) => {
+      if (restoring) return;
+      if (!e.isTrusted) return;
+      if (!isUsableControl(e.target)) return;
+      recordChange(e.target);
+      scheduleSave();
+    },
+    true
+  );
 
-  document.addEventListener("change", (e) => {
-    if (restoring) return;
-    if (!e.isTrusted) return;
-    if (!isUsableControl(e.target)) return;
-    recordChange(e.target);
-    scheduleSave();
-  }, true);
+  document.addEventListener(
+    "change",
+    (e) => {
+      if (restoring) return;
+      if (!e.isTrusted) return;
+      if (!isUsableControl(e.target)) return;
+      recordChange(e.target);
+      scheduleSave();
+    },
+    true
+  );
 
   // Messages from popup
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {

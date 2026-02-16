@@ -1,12 +1,12 @@
 {
   "manifest_version": 3,
-  "name": "form-input-restore",
+  "name": "Form Input Restore",
   "version": "1.0.0",
   "description": "Automatically saves form fields (input, select, textarea) per page and allows you to restore the most recently entered data. It is especially useful when the browser is closed, the page is accidentally refreshed, the session expires, or form data unexpectedly disappears.",
   "permissions": ["storage", "activeTab"],
   "host_permissions": ["<all_urls>"],
   "action": {
-    "default_title": "Form input restore",
+    "default_title": "Form Input Restore",
     "default_popup": "popup.html"
   },
   "content_scripts": [
